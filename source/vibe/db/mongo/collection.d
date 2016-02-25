@@ -1,7 +1,7 @@
 /**
 	MongoCollection class
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -9,6 +9,7 @@ module vibe.db.mongo.collection;
 
 public import vibe.db.mongo.cursor;
 public import vibe.db.mongo.connection;
+public import vibe.db.mongo.flags;
 
 import vibe.core.log;
 import vibe.db.mongo.client;
@@ -85,6 +86,11 @@ struct MongoCollection {
 
 	/**
 	  Inserts new documents into the collection.
+
+	  Note that if the `_id` field of the document(s) is not set, typically
+	  using `BsonObjectID.generate()`, the server will generate IDs
+	  automatically. If you need to know the IDs of the inserted documents,
+	  you need to generate them locally.
 
 	  Throws: Exception if a DB communication error occured.
 	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Inserting)
@@ -350,8 +356,8 @@ struct MongoCollection {
 	/**
 		Creates or updates an index.
 
-		Note that the overload taking an associative array of field orders is
-		scheduled for deprecation. Since the order of fields matters, it is
+		Note that the overload taking an associative array of field orders
+		will be removed. Since the order of fields matters, it is
 		only suitable for single-field indices.
 	*/
 	void ensureIndex(scope const(Tuple!(string, int))[] field_orders, IndexFlags flags = IndexFlags.None, Duration expire_time = 0.seconds)
@@ -383,6 +389,7 @@ struct MongoCollection {
 		database["system.indexes"].insert(doc);
 	}
 	/// ditto
+	deprecated("Use the overload taking an array of field_orders instead.")
 	void ensureIndex(int[string] field_orders, IndexFlags flags = IndexFlags.None, ulong expireAfterSeconds = 0)
 	{
 		Tuple!(string, int)[] orders;
@@ -442,6 +449,52 @@ unittest {
 		// JSON is another possibility
 		Json jusr = parseJsonString(`{"name": "admin", "password": "secret"}`);
 		users.insert(jusr);
+	}
+}
+
+/// Using the type system to define a document "schema"
+unittest {
+	import vibe.db.mongo.mongo;
+	import vibe.data.serialization : name;
+	import std.typecons : Nullable;
+
+	// Nested object within a "User" document
+	struct Address {
+		string name;
+		string street;
+		int zipCode;
+	}
+
+	// The document structure of the "myapp.users" collection
+	struct User {
+		@name("_id") BsonObjectID id; // represented as "_id" in the database
+		string loginName;
+		string password;
+		Address address;
+	}
+
+	void test()
+	{
+		MongoClient client = connectMongoDB("127.0.0.1");
+		MongoCollection users = client.getCollection("myapp.users");
+
+		// D values are automatically serialized to the internal BSON format
+		// upon insertion - see also vibe.data.serialization
+		User usr;
+		usr.id = BsonObjectID.generate();
+		usr.loginName = "admin";
+		usr.password = "secret";
+		users.insert(usr);
+
+		// find supports direct de-serialization of the returned documents
+		foreach (usr; users.find!User()) {
+			logInfo("User: %s", usr.loginName);
+		}
+
+		// the same goes for findOne
+		Nullable!User qusr = users.findOne!User(["_id": usr.id]);
+		if (!qusr.isNull)
+			logInfo("User: %s", qusr.loginName);
 	}
 }
 

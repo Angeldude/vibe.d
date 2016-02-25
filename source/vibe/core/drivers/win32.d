@@ -28,13 +28,19 @@ import core.time;
 import core.thread;
 import std.algorithm;
 import std.conv;
-import std.c.windows.windows;
-import std.c.windows.winsock;
 import std.datetime;
 import std.exception;
 import std.string : lastIndexOf;
 import std.typecons;
 import std.utf;
+
+static if (__VERSION__ >= 2070) {
+	import core.sys.windows.windows;
+	import core.sys.windows.winsock2;
+} else {
+	import std.c.windows.windows;
+	import std.c.windows.winsock;
+}
 
 enum WM_USER_SIGNAL = WM_USER+101;
 enum WM_USER_SOCKET = WM_USER+102;
@@ -88,9 +94,22 @@ final class Win32EventDriver : EventDriver {
 
 	int runEventLoop()
 	{
+		void removePendingQuitMessages() {
+			MSG msg;
+			while (PeekMessageW(&msg, null, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+		}
+
+		// clear all possibly outstanding WM_QUIT messages to avoid
+		// them having an influence this runEventLoop()
+		removePendingQuitMessages();
+
 		m_exit = false;
-		while( !m_exit && haveEvents() )
+		while (!m_exit && haveEvents())
 			runEventLoopOnce();
+
+		// remove quit messages here to avoid them having an influence on
+		// processEvets or runEventLoopOnce
+		removePendingQuitMessages();
 		return 0;
 	}
 
@@ -258,17 +277,13 @@ final class Win32EventDriver : EventDriver {
 		return addr;
 	}
 
-	Win32TCPConnection connectTCP(NetworkAddress addr)
+	Win32TCPConnection connectTCP(NetworkAddress addr, NetworkAddress bind_addr)
 	{
 		assert(m_tid == GetCurrentThreadId());
 
 		auto sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, null, 0, WSA_FLAG_OVERLAPPED);
 		socketEnforce(sock != INVALID_SOCKET, "Failed to create socket");
 
-		NetworkAddress bind_addr;
-		bind_addr.family = addr.family;
-		if (addr.family == AF_INET) bind_addr.sockAddrInet4.sin_addr.s_addr = 0;
-		else bind_addr.sockAddrInet6.sin6_addr.s6_addr[] = 0;
 		socketEnforce(bind(sock, bind_addr.sockAddr, bind_addr.sockAddrLen) == 0, "Failed to bind socket");
 
 		auto conn = new Win32TCPConnection(this, sock, addr);
@@ -291,9 +306,12 @@ final class Win32EventDriver : EventDriver {
 		socketEnforce(listen(sock, 128) == 0,
 			"Failed to listen");
 
+		socklen_t balen = addr.sockAddrLen;
+		socketEnforce(getsockname(sock, addr.sockAddr, &balen) == 0, "getsockname failed");
+
 		// TODO: support TCPListenOptions.distribute
 
-		return new Win32TCPListener(this, sock, conn_callback, options);
+		return new Win32TCPListener(this, sock, addr, conn_callback, options);
 	}
 
 	Win32UDPConnection listenUDP(ushort port, string bind_address = "0.0.0.0")
@@ -434,7 +452,8 @@ final class Win32ManualEvent : ManualEvent {
 	}
 
 	this(Win32EventDriver driver)
-	{
+	nothrow {
+		scope (failure) assert(false); // Mutex.this() now nothrow < 2.070
 		m_mutex = new core.sync.mutex.Mutex;
 		m_driver = driver;
 	}
@@ -837,7 +856,7 @@ final class Win32DirectoryWatcher : DirectoryWatcher {
 				case 0x4: kind = DirectoryChangeType.removed; break;
 				case 0x5: kind = DirectoryChangeType.added; break;
 			}
-			string filename = to!string(fni.FileName.ptr[0 .. fni.FileNameLength/2]);
+			string filename = to!string(fni.FileName[0 .. fni.FileNameLength/2]);
 			dst ~= DirectoryChange(kind, Path(filename));
 			//logTrace("File changed: %s", fni.FileName.ptr[0 .. fni.FileNameLength/2]);
 			if( fni.NextEntryOffset == 0 ) break;
@@ -1304,11 +1323,15 @@ final class Win32TCPConnection : TCPConnection, SocketEventHandler {
 		if( auto fstream = cast(Win32FileStream)stream ){
 			if( fstream.tell() == 0 && fstream.size <= 1<<31 ){
 				acquireWriter();
-				scope(exit) releaseWriter();
-				logDebug("Using sendfile! %s %s %s", fstream.m_handle, fstream.tell(), fstream.size);
-
 				m_bytesTransferred = 0;
 				m_driver.m_fileWriters[this] = true;
+				scope(exit) {
+					if (this in m_driver.m_fileWriters)
+						m_driver.m_fileWriters.remove(this);
+					releaseWriter();
+				}
+				logDebug("Using sendfile! %s %s %s", fstream.m_handle, fstream.tell(), fstream.size);
+
 				if( TransmitFile(m_socket, fstream.m_handle, 0, 0, &m_fileOverlapped, null, 0) )
 					m_bytesTransferred = 1;
 
@@ -1339,12 +1362,15 @@ final class Win32TCPConnection : TCPConnection, SocketEventHandler {
 	{
 		if( !GetOverlappedResult(m_transferredFile, &m_fileOverlapped, &m_bytesTransferred, false) ){
 			if( GetLastError() != ERROR_IO_PENDING ){
-				m_driver.m_core.resumeTask(m_writeOwner, new Exception("File transfer over TCP failed."));
-				return true;
+				auto ex = new Exception("File transfer over TCP failed.");
+				if (m_writeOwner != Task.init) {
+					m_driver.m_core.resumeTask(m_writeOwner, ex);
+					return true;
+				} else throw ex;
 			}
 			return false;
 		} else {
-			m_driver.m_core.resumeTask(m_writeOwner);
+			if (m_writeOwner != Task.init) m_driver.m_core.resumeTask(m_writeOwner);
 			return true;
 		}
 	}
@@ -1483,19 +1509,26 @@ final class Win32TCPListener : TCPListener, SocketEventHandler {
 	private {
 		Win32EventDriver m_driver;
 		SOCKET m_socket;
+		NetworkAddress m_bindAddress;
 		void delegate(TCPConnection conn) m_connectionCallback;
 		TCPListenOptions m_options;
 	}
 
-	this(Win32EventDriver driver, SOCKET sock, void delegate(TCPConnection conn) conn_callback, TCPListenOptions options)
+	this(Win32EventDriver driver, SOCKET sock, NetworkAddress bind_addr, void delegate(TCPConnection conn) conn_callback, TCPListenOptions options)
 	{
 		m_driver = driver;
 		m_socket = sock;
+		m_bindAddress = bind_addr;
 		m_connectionCallback = conn_callback;
 		m_driver.m_socketHandlers[sock] = this;
 		m_options = options;
 
 		WSAAsyncSelect(sock, m_driver.m_hwnd, WM_USER_SOCKET, FD_ACCEPT);
+	}
+
+	@property NetworkAddress bindAddress()
+	{
+		return m_bindAddress;
 	}
 
 	void stopListening()
@@ -1545,7 +1578,7 @@ private {
 void setupWindowClass() nothrow
 {
 	if( s_setupWindowClass ) return;
-	WNDCLASS wc;
+	WNDCLASSA wc;
 	wc.lpfnWndProc = &Win32EventDriver.onMessage;
 	wc.lpszClassName = "VibeWin32MessageWindow";
 	RegisterClassA(&wc);

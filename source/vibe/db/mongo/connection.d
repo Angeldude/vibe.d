@@ -1,7 +1,7 @@
 /**
 	Low level mongodb protocol.
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2016 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -11,8 +11,10 @@ public import vibe.data.bson;
 
 import vibe.core.log;
 import vibe.core.net;
+import vibe.db.mongo.settings;
+import vibe.db.mongo.flags;
 import vibe.inet.webform;
-import vibe.stream.ssl;
+import vibe.stream.tls;
 
 import std.algorithm : map, splitter;
 import std.array;
@@ -104,15 +106,18 @@ class MongoAuthException : MongoException
   Note that a MongoConnection may only be used from one fiber/thread at a time.
  */
 final class MongoConnection {
+	import vibe.stream.wrapper : StreamOutputRange;
+
 	private {
 		MongoClientSettings m_settings;
 		TCPConnection m_conn;
 		Stream m_stream;
 		ulong m_bytesRead;
 		int m_msgid = 1;
+		StreamOutputRange m_outRange;
 	}
 
-	enum ushort defaultPort = 27017;
+	enum ushort defaultPort = MongoClientSettings.defaultPort;
 
 	/// Simplified constructor overload, with no m_settings
 	this(string server, ushort port = defaultPort)
@@ -139,17 +144,26 @@ final class MongoConnection {
 		 */
 		try {
 			m_conn = connectTCP(m_settings.hosts[0].name, m_settings.hosts[0].port);
+			m_conn.tcpNoDelay = true;
 			if (m_settings.ssl) {
-				auto ctx =  createSSLContext(SSLContextKind.client);
+				auto ctx =  createTLSContext(TLSContextKind.client);
 				if (!m_settings.sslverifycertificate) {
-					ctx.peerValidationMode = SSLPeerValidationMode.none;
+					ctx.peerValidationMode = TLSPeerValidationMode.none;
+				}
+				if (m_settings.sslPEMKeyFile) {
+					ctx.useCertificateChainFile(m_settings.sslPEMKeyFile);
+					ctx.usePrivateKeyFile(m_settings.sslPEMKeyFile);
+				}
+				if (m_settings.sslCAFile) {
+					ctx.useTrustedCertificateFile(m_settings.sslCAFile);
 				}
 
-				m_stream = createSSLStream(m_conn, ctx);
+				m_stream = createTLSStream(m_conn, ctx, m_settings.hosts[0].name);
 			}
 			else {
 				m_stream = m_conn;
 			}
+			m_outRange = StreamOutputRange(m_stream);
 		}
 		catch (Exception e) {
 			throw new MongoDriverException(format("Failed to connect to MongoDB server at %s:%s.", m_settings.hosts[0].name, m_settings.hosts[0].port), __FILE__, __LINE__, e);
@@ -159,6 +173,10 @@ final class MongoConnection {
 		if(m_settings.digest != string.init)
 		{
 			authenticate();
+		}
+		else if (m_settings.sslPEMKeyFile != null && m_settings.username != null)
+		{
+			certAuthenticate();
 		}
 	}
 
@@ -371,7 +389,7 @@ final class MongoConnection {
 		sendValue(response_to);
 		sendValue(cast(int)code);
 		foreach (a; args) sendValue(a);
-		m_stream.flush();
+		m_outRange.flush();
 		return id;
 	}
 
@@ -390,7 +408,7 @@ final class MongoConnection {
 		} else static assert(false, "Unexpected type: "~T.stringof);
 	}
 
-	private void sendBytes(in ubyte[] data){ m_stream.write(data); }
+	private void sendBytes(in ubyte[] data){ m_outRange.put(data); }
 
 	private int recvInt() { ubyte[int.sizeof] ret; recv(ret); return fromBsonData!int(ret); }
 	private long recvLong() { ubyte[long.sizeof] ret; recv(ret); return fromBsonData!long(ret); }
@@ -414,6 +432,24 @@ final class MongoConnection {
 		enforce(
 			err.code < 0,
 			new MongoDBException(err)
+		);
+	}
+
+	private void certAuthenticate()
+	{
+		Bson cmd = Bson.emptyObject;
+		cmd["authenticate"] = Bson(1);
+		cmd["mechanism"] = Bson("MONGODB-X509");
+		cmd["user"] = Bson(m_settings.username);
+		query!Bson("$external.$cmd", QueryFlags.None, 0, -1, cmd, Bson(null),
+			(cursor, flags, first_doc, num_docs) {
+				if ((flags & ReplyFlags.QueryFailure) || num_docs != 1)
+					throw new MongoDriverException("Calling authenticate failed.");
+			},
+			(idx, ref doc) {
+				if (doc["ok"].get!double != 1.0)
+					throw new MongoAuthException("Authentication failed.");
+			}
 		);
 	}
 
@@ -456,281 +492,6 @@ final class MongoConnection {
 	}
 }
 
-/**
- * Parses the given string as a mongodb URL. The URL must be in the form documented at
- * $(LINK http://www.mongodb.org/display/DOCS/Connections) which is:
- *
- * mongodb://[username:password@]host1[:port1][,host2[:port2],...[,hostN[:portN]]][/[database][?options]]
- *
- * Returns: true if the URL was successfully parsed. False if the URL can not be parsed.
- *
- * If the URL is successfully parsed the MongoClientSettings instance will contain the parsed config.
- * If the URL is not successfully parsed the information in the MongoClientSettings instance may be
- * incomplete and should not be used.
- */
-bool parseMongoDBUrl(out MongoClientSettings cfg, string url)
-{
-	cfg = new MongoClientSettings();
-
-	string tmpUrl = url[0..$]; // Slice of the url (not a copy)
-
-	if( !startsWith(tmpUrl, "mongodb://") )
-	{
-		return false;
-	}
-
-	// Reslice to get rid of 'mongodb://'
-	tmpUrl = tmpUrl[10..$];
-
-	auto authIndex = tmpUrl.indexOf('@');
-	sizediff_t hostIndex = 0; // Start of the host portion of the URL.
-
-	// Parse out the username and optional password.
-	if( authIndex != -1 )
-	{
-		// Set the host start to after the '@'
-		hostIndex = authIndex + 1;
-		string password;
-
-		auto colonIndex = tmpUrl[0..authIndex].indexOf(':');
-		if(colonIndex != -1)
-		{
-			cfg.username = tmpUrl[0..colonIndex];
-			password = tmpUrl[colonIndex + 1 .. authIndex];
-		} else {
-			cfg.username = tmpUrl[0..authIndex];
-		}
-
-		// Make sure the username is not empty. If it is then the parse failed.
-		if(cfg.username.length == 0)
-		{
-			return false;
-		}
-
-		cfg.digest = MongoClientSettings.makeDigest(cfg.username, password);
-	}
-
-	auto slashIndex = tmpUrl[hostIndex..$].indexOf("/");
-	if( slashIndex == -1 ) slashIndex = tmpUrl.length;
-	else slashIndex += hostIndex;
-
-	// Parse the hosts section.
-	try
-	{
-		foreach(entry; splitter(tmpUrl[hostIndex..slashIndex], ","))
-		{
-			auto hostPort = splitter(entry, ":");
-			string host = hostPort.front;
-			hostPort.popFront();
-			ushort port = MongoConnection.defaultPort;
-			if (!hostPort.empty) {
-				port = to!ushort(hostPort.front);
-				hostPort.popFront();
-			}
-			enforce(hostPort.empty, "Host specifications are expected to be of the form \"HOST:PORT,HOST:PORT,...\".");
-			cfg.hosts ~= MongoHost(host, port);
-		}
-	} catch (Exception e) {
-		return  false; // Probably failed converting the port to ushort.
-	}
-
-	// If we couldn't parse a host we failed.
-	if(cfg.hosts.length == 0)
-	{
-		return false;
-	}
-
-	if(slashIndex == tmpUrl.length)
-	{
-		// We're done parsing.
-		return true;
-	}
-
-	auto queryIndex = tmpUrl[slashIndex..$].indexOf("?");
-	if(queryIndex == -1){
-		// No query string. Remaining string is the database
-		queryIndex = tmpUrl.length;
-	} else {
-		queryIndex += slashIndex;
-	}
-
-	cfg.database = tmpUrl[slashIndex+1..queryIndex];
-	if(queryIndex != tmpUrl.length)
-	{
-		FormFields options;
-		parseURLEncodedForm(tmpUrl[queryIndex+1 .. $], options);
-		foreach (option, value; options) {
-			bool setBool(ref bool dst)
-			{
-				try {
-					dst = to!bool(value);
-					return true;
-				} catch( Exception e ){
-					logError("Value for '%s' must be 'true' or 'false' but was '%s'.", option, value);
-					return false;
-				}
-			}
-
-			bool setLong(ref long dst)
-			{
-				try {
-					dst = to!long(value);
-					return true;
-				} catch( Exception e ){
-					logError("Value for '%s' must be an integer but was '%s'.", option, value);
-					return false;
-				}
-			}
-
-			void warnNotImplemented()
-			{
-				logDiagnostic("MongoDB option %s not yet implemented.", option);
-			}
-
-			switch( option.toLower() ){
-				default: logWarn("Unknown MongoDB option %s", option); break;
-				case "slaveok": bool v; if( setBool(v) && v ) cfg.defQueryFlags |= QueryFlags.SlaveOk; break;
-				case "replicaset": cfg.replicaSet = value; warnNotImplemented(); break;
-				case "safe": setBool(cfg.safe); break;
-				case "fsync": setBool(cfg.fsync); break;
-				case "journal": setBool(cfg.journal); break;
-				case "connecttimeoutms": setLong(cfg.connectTimeoutMS); warnNotImplemented(); break;
-				case "sockettimeoutms": setLong(cfg.socketTimeoutMS); warnNotImplemented(); break;
-				case "ssl": setBool(cfg.ssl); break;
-				case "sslverifycertificate": setBool(cfg.sslverifycertificate); break;
-				case "wtimeoutms": setLong(cfg.wTimeoutMS); break;
-				case "w":
-					try {
-						if(icmp(value, "majority") == 0){
-							cfg.w = Bson("majority");
-						} else {
-							cfg.w = Bson(to!long(value));
-						}
-					} catch (Exception e) {
-						logError("Invalid w value: [%s] Should be an integer number or 'majority'", value);
-					}
-				break;
-			}
-		}
-
-		/* Some m_settings imply safe. If they are set, set safe to true regardless
-		 * of what it was set to in the URL string
-		 */
-		if( (cfg.w != Bson.init) || (cfg.wTimeoutMS != long.init) ||
-				cfg.journal 	 || cfg.fsync )
-		{
-			cfg.safe = true;
-		}
-	}
-
-	return true;
-}
-
-/* Test for parseMongoDBUrl */
-unittest
-{
-	MongoClientSettings cfg;
-
-	assert(parseMongoDBUrl(cfg, "mongodb://localhost"));
-	assert(cfg.hosts.length == 1);
-	assert(cfg.database == "");
-	assert(cfg.hosts[0].name == "localhost");
-	assert(cfg.hosts[0].port == 27017);
-	assert(cfg.defQueryFlags == QueryFlags.None);
-	assert(cfg.replicaSet == "");
-	assert(cfg.safe == false);
-	assert(cfg.w == Bson.init);
-	assert(cfg.wTimeoutMS == long.init);
-	assert(cfg.fsync == false);
-	assert(cfg.journal == false);
-	assert(cfg.connectTimeoutMS == long.init);
-	assert(cfg.socketTimeoutMS == long.init);
-	assert(cfg.ssl == bool.init);
-	assert(cfg.sslverifycertificate == true);
-
-	cfg = MongoClientSettings.init;
-	assert(parseMongoDBUrl(cfg, "mongodb://fred:foobar@localhost"));
-	assert(cfg.username == "fred");
-	//assert(cfg.password == "foobar");
-	assert(cfg.digest == MongoClientSettings.makeDigest("fred", "foobar"));
-	assert(cfg.hosts.length == 1);
-	assert(cfg.database == "");
-	assert(cfg.hosts[0].name == "localhost");
-	assert(cfg.hosts[0].port == 27017);
-
-	cfg = MongoClientSettings.init;
-	assert(parseMongoDBUrl(cfg, "mongodb://fred:@localhost/baz"));
-	assert(cfg.username == "fred");
-	//assert(cfg.password == "");
-	assert(cfg.digest == MongoClientSettings.makeDigest("fred", ""));
-	assert(cfg.database == "baz");
-	assert(cfg.hosts.length == 1);
-	assert(cfg.hosts[0].name == "localhost");
-	assert(cfg.hosts[0].port == 27017);
-
-	cfg = MongoClientSettings.init;
-	assert(parseMongoDBUrl(cfg, "mongodb://host1,host2,host3/?safe=true&w=2&wtimeoutMS=2000&slaveOk=true&ssl=true&sslverifycertificate=false"));
-	assert(cfg.username == "");
-	//assert(cfg.password == "");
-	assert(cfg.digest == "");
-	assert(cfg.database == "");
-	assert(cfg.hosts.length == 3);
-	assert(cfg.hosts[0].name == "host1");
-	assert(cfg.hosts[0].port == 27017);
-	assert(cfg.hosts[1].name == "host2");
-	assert(cfg.hosts[1].port == 27017);
-	assert(cfg.hosts[2].name == "host3");
-	assert(cfg.hosts[2].port == 27017);
-	assert(cfg.safe == true);
-	assert(cfg.w == Bson(2L));
-	assert(cfg.wTimeoutMS == 2000);
-	assert(cfg.defQueryFlags == QueryFlags.SlaveOk);
-	assert(cfg.ssl == true);
-	assert(cfg.sslverifycertificate == false);
-
-	cfg = MongoClientSettings.init;
-	assert(parseMongoDBUrl(cfg,
-				"mongodb://fred:flinstone@host1.example.com,host2.other.example.com:27108,host3:"
-				~ "27019/mydb?journal=true;fsync=true;connectTimeoutms=1500;sockettimeoutMs=1000;w=majority"));
-	assert(cfg.username == "fred");
-	//assert(cfg.password == "flinstone");
-	assert(cfg.digest == MongoClientSettings.makeDigest("fred", "flinstone"));
-	assert(cfg.database == "mydb");
-	assert(cfg.hosts.length == 3);
-	assert(cfg.hosts[0].name == "host1.example.com");
-	assert(cfg.hosts[0].port == 27017);
-	assert(cfg.hosts[1].name == "host2.other.example.com");
-	assert(cfg.hosts[1].port == 27108);
-	assert(cfg.hosts[2].name == "host3");
-	assert(cfg.hosts[2].port == 27019);
-	assert(cfg.fsync == true);
-	assert(cfg.journal == true);
-	assert(cfg.connectTimeoutMS == 1500);
-	assert(cfg.socketTimeoutMS == 1000);
-	assert(cfg.w == Bson("majority"));
-	assert(cfg.safe == true);
-
-	// Invalid URLs - these should fail to parse
-	cfg = MongoClientSettings.init;
-	assert(! (parseMongoDBUrl(cfg, "localhost:27018")));
-	assert(! (parseMongoDBUrl(cfg, "http://blah")));
-	assert(! (parseMongoDBUrl(cfg, "mongodb://@localhost")));
-	assert(! (parseMongoDBUrl(cfg, "mongodb://:thepass@localhost")));
-	assert(! (parseMongoDBUrl(cfg, "mongodb://:badport/")));
-
-	assert(parseMongoDBUrl(cfg, "mongodb://me:sl$ash/w0+rd@localhost"));
-	assert(cfg.digest == MongoClientSettings.makeDigest("me", "sl$ash/w0+rd"));
-	assert(cfg.hosts.length == 1);
-	assert(cfg.hosts[0].name == "localhost");
-	assert(cfg.hosts[0].port == 27017);
-	assert(parseMongoDBUrl(cfg, "mongodb://me:sl$ash/w0+rd@localhost/mydb"));
-	assert(cfg.digest == MongoClientSettings.makeDigest("me", "sl$ash/w0+rd"));
-	assert(cfg.database == "mydb");
-	assert(cfg.hosts.length == 1);
-	assert(cfg.hosts[0].name == "localhost");
-	assert(cfg.hosts[0].port == 27017);
-}
-
 private enum OpCode : int {
 	Reply        = 1, // sent only by DB
 	Msg          = 1000,
@@ -746,104 +507,12 @@ private enum OpCode : int {
 alias ReplyDelegate = void delegate(long cursor, ReplyFlags flags, int first_doc, int num_docs);
 template DocDelegate(T) { alias DocDelegate = void delegate(size_t idx, ref T doc); }
 
-enum UpdateFlags {
-	none         = 0,    /// Normal update of a single document.
-	upsert       = 1<<0, /// Creates a document if none exists.
-	multiUpdate  = 1<<1, /// Updates all matching documents.
-
-	None = none, /// Deprecated compatibility alias
-	Upsert = upsert, /// Deprecated compatibility alias
-	MultiUpdate = multiUpdate /// Deprecated compatibility alias
-}
-
-enum InsertFlags {
-	none             = 0,    /// Normal insert.
-	continueOnError  = 1<<0, /// For multiple inserted documents, continues inserting further documents after a failure.
-
-	None = none, /// Deprecated compatibility alias
-	ContinueOnError = continueOnError /// Deprecated compatibility alias
-}
-
-enum QueryFlags {
-	none             = 0,    /// Normal query
-	tailableCursor   = 1<<1, /// 
-	slaveOk          = 1<<2, /// 
-	oplogReplay      = 1<<3, /// 
-	noCursorTimeout  = 1<<4, /// 
-	awaitData        = 1<<5, /// 
-	exhaust          = 1<<6, /// 
-	partial          = 1<<7, /// 
-
-	None = none, /// Deprecated compatibility alias
-	TailableCursor = tailableCursor, /// Deprecated compatibility alias
-	SlaveOk = slaveOk, /// Deprecated compatibility alias
-	OplogReplay = oplogReplay, /// Deprecated compatibility alias
-	NoCursorTimeout = noCursorTimeout, /// Deprecated compatibility alias
-	AwaitData = awaitData, /// Deprecated compatibility alias
-	Exhaust = exhaust, /// Deprecated compatibility alias
-	Partial = partial /// Deprecated compatibility alias
-}
-
-enum DeleteFlags {
-	none          = 0,
-	singleRemove  = 1<<0,
-
-	None = none, /// Deprecated compatibility alias
-	SingleRemove = singleRemove /// Deprecated compatibility alias
-}
-
-enum ReplyFlags {
-	none              = 0,
-	cursorNotFound    = 1<<0,
-	queryFailure      = 1<<1,
-	shardConfigStale  = 1<<2,
-	awaitCapable      = 1<<3,
-
-	None = none, /// Deprecated compatibility alias
-	CursorNotFound = cursorNotFound, /// Deprecated compatibility alias
-	QueryFailure = queryFailure, /// Deprecated compatibility alias
-	ShardConfigStale = shardConfigStale, /// Deprecated compatibility alias
-	AwaitCapable = awaitCapable /// Deprecated compatibility alias
-}
-
-/// [internal]
-class MongoClientSettings
-{
-	string username;
-	string digest;
-	MongoHost[] hosts;
-	string database;
-	QueryFlags defQueryFlags = QueryFlags.None;
-	string replicaSet;
-	bool safe;
-	Bson w; // Either a number or the string 'majority'
-	long wTimeoutMS;
-	bool fsync;
-	bool journal;
-	long connectTimeoutMS;
-	long socketTimeoutMS;
-	bool ssl;
-	bool sslverifycertificate = true;
-
-	static string makeDigest(string username, string password)
-	{
-		return md5Of(username ~ ":mongo:" ~ password).toHexString().idup.toLower();
-	}
-}
-
 struct MongoDBInfo
 {
 	string name;
 	double sizeOnDisk;
 	bool empty;
 }
-
-private struct MongoHost
-{
-	string name;
-	ushort port;
-}
-
 
 private int sendLength(ARGS...)(ARGS args)
 {

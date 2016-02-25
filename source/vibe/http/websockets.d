@@ -35,6 +35,9 @@ import vibe.core.log;
 import vibe.core.net;
 import vibe.stream.operations;
 import vibe.http.server;
+import vibe.http.client;
+import vibe.core.connectionpool;
+import vibe.utils.array;
 
 import core.time;
 import std.array;
@@ -45,7 +48,10 @@ import std.bitmanip;
 import std.digest.sha;
 import std.string;
 import std.functional;
-
+import std.uuid;
+import std.base64;
+import std.digest.sha;
+import vibe.crypto.cryptorand;
 
 /// Exception thrown by $(D vibe.http.websockets).
 class WebSocketException: Exception
@@ -61,6 +67,92 @@ class WebSocketException: Exception
 	{
 		super(msg, next, file, line);
 	}
+}
+
+/**
+	Returns a WebSocket client object that is connected to the specified host.
+*/
+WebSocket connectWebSocket(URL url, HTTPClientSettings settings = defaultSettings)
+{
+	auto host = url.host;
+	auto port = url.port;
+	bool use_tls = (url.schema == "wss") ? true : false;
+
+	if (port == 0) 
+		port = (use_tls) ? 443 : 80;
+
+	static struct ConnInfo { string host; ushort port; bool useTLS; string proxyIP; ushort proxyPort; }
+	static FixedRingBuffer!(Tuple!(ConnInfo, ConnectionPool!HTTPClient), 16) s_connections;
+	auto   ckey = ConnInfo(host, port, use_tls, settings ? settings.proxyURL.host : null, settings ? settings.proxyURL.port : 0);
+
+	ConnectionPool!HTTPClient pool;
+	foreach (c; s_connections)
+		if (c[0].host == host && c[0].port == port && c[0].useTLS == use_tls && (settings is null || (c[0].proxyIP == settings.proxyURL.host && c[0].proxyPort == settings.proxyURL.port)))
+			pool = c[1];
+
+	if (!pool)
+	{
+		logDebug("Create HTTP client pool %s:%s %s proxy %s:%d", host, port, use_tls, (settings) ? settings.proxyURL.host : string.init, (settings) ? settings.proxyURL.port : 0);
+		pool = new ConnectionPool!HTTPClient({
+			auto ret = new HTTPClient;
+			ret.connect(host, port, use_tls, settings);
+			return ret;
+		});
+		if (s_connections.full)
+			s_connections.popFront();
+		s_connections.put(tuple(ckey, pool));
+	}
+
+	auto challengeKey = generateChallengeKey();
+	auto answerKey = computeAcceptKey(challengeKey);
+	auto cl = pool.lockConnection();
+	auto res = cl.request((scope req){
+		req.requestURL = (url.localURI == "") ? "/" : url.localURI;
+		req.method = HTTPMethod.GET;
+		req.headers["Upgrade"] = "websocket";
+		req.headers["Connection"] = "Upgrade";
+		req.headers["Sec-WebSocket-Version"] = "13";
+		req.headers["Sec-WebSocket-Key"] = challengeKey;
+	});
+
+	enforce(res.statusCode == HTTPStatus.switchingProtocols, "Server didn't accept the protocol upgrade request.");
+
+	auto key = "sec-websocket-accept" in res.headers;
+	enforce(key !is null, "Response is missing the Sec-WebSocket-Accept header.");
+	enforce(*key == answerKey, "Response has wrong accept key");
+	auto conn = res.switchProtocol("websocket");
+	auto ws = new WebSocket(conn, null, false);
+	return ws;
+}
+
+/// ditto
+void connectWebSocket(URL url, scope void delegate(scope WebSocket sock) del, HTTPClientSettings settings = defaultSettings)
+{
+	bool use_tls = (url.schema == "wss") ? true : false;
+	url.schema = use_tls ? "https" : "http";
+
+	auto challengeKey = generateChallengeKey();
+	auto answerKey = computeAcceptKey(challengeKey);
+
+	requestHTTP(url,
+		(scope req) {
+			req.method = HTTPMethod.GET;
+			req.headers["Upgrade"] = "websocket";
+			req.headers["Connection"] = "Upgrade";
+			req.headers["Sec-WebSocket-Version"] = "13";
+			req.headers["Sec-WebSocket-Key"] = challengeKey;
+		},
+		(scope res) {
+			enforce(res.statusCode == HTTPStatus.switchingProtocols, "Server didn't accept the protocol upgrade request.");
+			auto key = "sec-websocket-accept" in res.headers;
+			enforce(key !is null, "Response is missing the Sec-WebSocket-Accept header.");
+			enforce(*key == answerKey, "Response has wrong accept key");
+			res.switchProtocol("websocket", (conn) {
+				scope ws = new WebSocket(conn, null, false);
+				del(ws);
+			});
+		}
+	);
 }
 
 /**
@@ -85,14 +177,17 @@ void handleWebSocket(scope WebSocketHandshakeDelegate on_handshake, scope HTTPSe
 			}
 		}
 	}
-	if( !(isUpgrade &&
-		  pUpgrade && icmp(*pUpgrade, "websocket") == 0 &&
-		  pKey &&
-		  pVersion && *pVersion == "13") )
-	{
-		logDebug("Browser sent invalid WebSocket request.");
+
+	string req_error;
+	if (!isUpgrade) req_error = "WebSocket endpoint only accepts \"Connection: upgrade\" requests.";
+	else if (!pUpgrade || icmp(*pUpgrade, "websocket") != 0) req_error = "WebSocket endpoint requires \"Upgrade: websocket\" header.";
+	else if (!pVersion || *pVersion != "13") req_error = "Only version 13 of the WebSocket protocol is supported.";
+	else if (!pKey) req_error = "Missing \"Sec-WebSocket-Key\" header.";
+
+	if (req_error.length) {
+		logDebug("Browser sent invalid WebSocket request: %s", req_error);
 		res.statusCode = HTTPStatus.badRequest;
-		res.writeVoidBody();
+		res.writeBody(req_error);
 		return;
 	}
 
@@ -153,19 +248,19 @@ HTTPServerRequestDelegateS handleWebSockets(WebSocketHandshakeDelegate on_handsh
 		auto accept = cast(string)Base64.encode(sha1Of(*pKey ~ s_webSocketGuid));
 		res.headers["Sec-WebSocket-Accept"] = accept;
 		res.headers["Connection"] = "Upgrade";
-		ConnectionStream conn = res.switchProtocol("websocket");
-
-		// TODO: put back 'scope' once it is actually enforced by DMD
-		/*scope*/ auto socket = new WebSocket(conn, req);
-		try on_handshake(socket);
-		catch (Exception e) {
-			logDiagnostic("WebSocket handler failed: %s", e.msg);
-		} catch (Throwable th) {
-			// pretend to have sent a closing frame so that any further sends will fail
-			socket.m_sentCloseFrame = true;
-			throw th;
-		}
-		socket.close();
+		res.switchProtocol("websocket", (scope conn) {
+			// TODO: put back 'scope' once it is actually enforced by DMD
+			/*scope*/ auto socket = new WebSocket(conn, req);
+			try on_handshake(socket);
+			catch (Exception e) {
+				logDiagnostic("WebSocket handler failed: %s", e.msg);
+			} catch (Throwable th) {
+				// pretend to have sent a closing frame so that any further sends will fail
+				socket.m_sentCloseFrame = true;
+				throw th;
+			}
+			socket.close();
+		});
 	}
 	return &callback;
 }
@@ -187,21 +282,25 @@ final class WebSocket {
 		uint m_lastPingIndex;
 		bool m_pongReceived;
 		bool m_pongSkipped;
+		bool m_isServer = true;
 	}
 
-	this(ConnectionStream conn, in HTTPServerRequest request)
+	this(ConnectionStream conn, in HTTPServerRequest request, bool is_server = true)
 	{
 		m_conn = conn;
 		m_request = request;
+		m_isServer = is_server;
 		assert(m_conn);
-		m_reader = runTask(&startReader);
 		m_writeMutex = new InterruptibleTaskMutex;
 		m_readMutex = new InterruptibleTaskMutex;
 		m_readCondition = new InterruptibleTaskCondition(m_readMutex);
-		if (request !is null && request.serverSettings.webSocketPingInterval != Duration.zero) {
-			m_pingTimer = setTimer(request.serverSettings.webSocketPingInterval, &sendPing, true);
-			m_pongReceived = true;
-		}
+		m_readMutex.performLocked!({
+			m_reader = runTask(&startReader);
+			if (request !is null && request.serverSettings.webSocketPingInterval != Duration.zero) {
+				m_pingTimer = setTimer(request.serverSettings.webSocketPingInterval, &sendPing, true);
+				m_pongReceived = true;
+			}
+		});
 	}
 
 	/**
@@ -288,7 +387,7 @@ final class WebSocket {
 	{
 		m_writeMutex.performLocked!({
 			enforceEx!WebSocketException(!m_sentCloseFrame, "WebSocket connection already actively closed.");
-			scope message = new OutgoingWebSocketMessage(m_conn, frameOpcode);
+			scope message = new OutgoingWebSocketMessage(m_conn, frameOpcode, m_isServer);
 			scope(exit) message.finalize();
 			sender(message);
 		});
@@ -310,6 +409,7 @@ final class WebSocket {
 			m_writeMutex.performLocked!({
 				m_sentCloseFrame = true;
 				Frame frame;
+				frame.isServer = m_isServer;
 				frame.opcode = FrameOpcode.close;
 				if(code != 0)
 					frame.payload = std.bitmanip.nativeToBigEndian(code) ~ cast(ubyte[])reason;
@@ -370,6 +470,7 @@ final class WebSocket {
 
 	private void startReader()
 	{
+		m_readMutex.performLocked!({}); //Wait until initialization
 		scope (exit) m_readCondition.notifyAll();
 		try {
 			while (!m_conn.empty) {
@@ -422,6 +523,7 @@ final class WebSocket {
 		m_writeMutex.performLocked!({
 			m_pongReceived = false;
 			Frame ping;
+			ping.isServer = m_isServer;
 			ping.opcode = FrameOpcode.ping;
 			ping.fin = true;
 			ping.payload = nativeToLittleEndian(++m_lastPingIndex);
@@ -440,13 +542,15 @@ final class OutgoingWebSocketMessage : OutputStream {
 		FrameOpcode m_frameOpcode;
 		Appender!(ubyte[]) m_buffer;
 		bool m_finalized = false;
+		bool m_isServer;
 	}
 
-	this( Stream conn, FrameOpcode frameOpcode )
+	this( Stream conn, FrameOpcode frameOpcode, bool is_server = true )
 	{
 		assert(conn !is null);
 		m_conn = conn;
 		m_frameOpcode = frameOpcode;
+		m_isServer = is_server;
 	}
 
 	void write(in ubyte[] bytes)
@@ -459,6 +563,7 @@ final class OutgoingWebSocketMessage : OutputStream {
 	{
 		assert(!m_finalized);
 		Frame frame;
+		frame.isServer = m_isServer;
 		frame.opcode = m_frameOpcode;
 		frame.fin = false;
 		frame.payload = m_buffer.data;
@@ -473,6 +578,7 @@ final class OutgoingWebSocketMessage : OutputStream {
 		m_finalized = true;
 
 		Frame frame;
+		frame.isServer = m_isServer;
 		frame.fin = true;
 		frame.opcode = m_frameOpcode;
 		frame.payload = m_buffer.data;
@@ -576,6 +682,7 @@ struct Frame {
 	bool fin;
 	FrameOpcode opcode;
 	ubyte[] payload;
+	bool isServer = true;
 
 
 	void writeFrame(OutputStream stream)
@@ -588,16 +695,31 @@ struct Frame {
 		if (fin) firstByte |= 0x80;
 		rng.put(firstByte);
 
+		auto b1 = 0;
+		if (!isServer) {
+			b1 = 0x80;
+		}
+
 		if( payload.length < 126 ) {
-			rng.put(std.bitmanip.nativeToBigEndian(cast(ubyte)payload.length));
+			rng.put(std.bitmanip.nativeToBigEndian(cast(ubyte)(b1 | payload.length)));
 		} else if( payload.length <= 65536 ) {
-			rng.put(cast(ubyte[])[126]);
+			rng.put(cast(ubyte[])[(b1 | 126)]);
 			rng.put(std.bitmanip.nativeToBigEndian(cast(ushort)payload.length));
 		} else {
-			rng.put(cast(ubyte[])[127]);
+			rng.put(cast(ubyte[])[(b1 | 127)]);
 			rng.put(std.bitmanip.nativeToBigEndian(payload.length));
 		}
-		rng.put(payload);
+
+		if (!isServer) {
+			auto key = generateNewMaskKey();
+			rng.put(key);
+			for (size_t i = 0; i < payload.length; i++) {
+				payload[i] ^= key[i % 4];
+			}
+			rng.put(payload);
+		}else {
+			rng.put(payload);
+		}
 		rng.flush();
 		stream.flush();
 	}
@@ -640,4 +762,32 @@ struct Frame {
 
 		return frame;
 	}
+}
+
+private ubyte[] generateNewMaskKey() 
+{
+	auto rng = new SystemRNG();
+	auto buffer = new ubyte[4];
+	rng.read(buffer);
+	return buffer;
+}
+
+private string generateChallengeKey()
+{
+	auto uuid = randomUUID().toString();
+	immutable(ubyte)[] b = uuid.representation;
+	auto result = Base64.encode(b);
+	return to!(string)(result);
+}
+
+private string computeAcceptKey(string challengekey)
+{
+	immutable(ubyte)[] b = challengekey.representation;
+	immutable(ubyte)[] a = s_webSocketGuid.representation;
+	SHA1 hash;
+	hash.start();
+	hash.put(b);
+	hash.put(a);
+	auto result = Base64.encode(hash.finish());
+	return to!(string)(result);
 }

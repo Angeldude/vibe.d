@@ -26,7 +26,7 @@ Allocator defaultAllocator() nothrow
 		return manualAllocator();
 	} else {
 		static __gshared Allocator alloc;
-		if( !alloc ){
+		if (!alloc) {
 			alloc = new GCAllocator;
 			//alloc = new AutoFreeListAllocator(alloc);
 			//alloc = new DebugAllocator(alloc);
@@ -44,6 +44,29 @@ Allocator manualAllocator() nothrow
 		alloc = new AutoFreeListAllocator(alloc);
 		//alloc = new DebugAllocator(alloc);
 		alloc = new LockAllocator(alloc);
+	}
+	return alloc;
+}
+
+Allocator threadLocalAllocator() nothrow
+{
+	static Allocator alloc;
+	if (!alloc) {
+		version(VibeManualMemoryManagement) alloc = new MallocAllocator;
+		else alloc = new GCAllocator;
+		alloc = new AutoFreeListAllocator(alloc);
+		// alloc = new DebugAllocator(alloc);
+	}
+	return alloc;
+}
+
+Allocator threadLocalManualAllocator() nothrow
+{
+	static Allocator alloc;
+	if (!alloc) {
+		alloc = new MallocAllocator;
+		alloc = new AutoFreeListAllocator(alloc);
+		// alloc = new DebugAllocator(alloc);
 	}
 	return alloc;
 }
@@ -308,49 +331,71 @@ final class AutoFreeListAllocator : Allocator {
 
 	void[] alloc(size_t sz)
 	{
-		if (sz > nthFreeListSize!(freeListCount-1)) return m_baseAlloc.alloc(sz);
-		foreach (i; iotaTuple!freeListCount)
-			if (sz <= nthFreeListSize!(i))
-				return m_freeLists[i].alloc().ptr[0 .. sz];
-		//logTrace("AFL alloc %08X(%d)", ret.ptr, sz);
-		assert(false);
+		auto idx = getAllocatorIndex(sz);
+		return idx < freeListCount ? m_freeLists[idx].alloc()[0 .. sz] : m_baseAlloc.alloc(sz);
 	}
 
 	void[] realloc(void[] data, size_t sz)
 	{
-		foreach (fl; m_freeLists) {
-			if (data.length <= fl.elementSize) {
+		auto curidx = getAllocatorIndex(data.length);
+		auto newidx = getAllocatorIndex(sz);
+		
+		if (curidx == newidx) {
+			if (curidx == freeListCount) {
+				// forward large blocks to the base allocator
+				return m_baseAlloc.realloc(data, sz);
+			} else {
 				// just grow the slice if it still fits into the free list slot
-				if (sz <= fl.elementSize)
-					return data.ptr[0 .. sz];
-
-				// otherwise re-allocate
-				auto newd = alloc(sz);
-				assert(newd.ptr+sz <= data.ptr || newd.ptr >= data.ptr+data.length, "New block overlaps old one!?");
-				auto len = min(data.length, sz);
-				newd[0 .. len] = data[0 .. len];
-				free(data);
-				return newd;
+				return data.ptr[0 .. sz];
 			}
 		}
-		// forward large blocks to the base allocator
-		return m_baseAlloc.realloc(data, sz);
+
+		// otherwise re-allocate manually
+		auto newd = alloc(sz);
+		assert(newd.ptr+sz <= data.ptr || newd.ptr >= data.ptr+data.length, "New block overlaps old one!?");
+		auto len = min(data.length, sz);
+		newd[0 .. len] = data[0 .. len];
+		free(data);
+		return newd;
 	}
 
 	void free(void[] data)
 	{
 		//logTrace("AFL free %08X(%s)", data.ptr, data.length);
-		if (data.length > nthFreeListSize!(freeListCount-1)) {
-			m_baseAlloc.free(data);
-			return;
+		auto idx = getAllocatorIndex(data.length);
+		if (idx < freeListCount) m_freeLists[idx].free(data.ptr[0 .. 1 << (idx + minExponent)]);
+		else m_baseAlloc.free(data);
+	}
+
+	// does a CT optimized binary search for the right allocater
+	private int getAllocatorIndex(size_t sz)
+	@safe nothrow @nogc {
+		//pragma(msg, getAllocatorIndexStr!(0, freeListCount));
+		return mixin(getAllocatorIndexStr!(0, freeListCount));
+	}
+
+	private template getAllocatorIndexStr(int low, int high)
+	{
+		static if (__VERSION__ <= 2066) import std.string : format;
+		else import std.format : format;
+		static if (low == high) enum getAllocatorIndexStr = format("%s", low);
+		else {
+			enum mid = (low + high) / 2;
+			enum getAllocatorIndexStr =
+				"sz > nthFreeListSize!%s ? %s : %s"
+				.format(mid, getAllocatorIndexStr!(mid+1, high), getAllocatorIndexStr!(low, mid));
 		}
-		foreach(i; iotaTuple!freeListCount) {
-			if (data.length <= nthFreeListSize!i) {
-				m_freeLists[i].free(data.ptr[0 .. nthFreeListSize!i]);
-				return;
-			}
+	}
+
+	unittest {
+		auto a = new AutoFreeListAllocator(null);
+		assert(a.getAllocatorIndex(0) == 0);
+		foreach (i; iotaTuple!freeListCount) {
+			assert(a.getAllocatorIndex(nthFreeListSize!i-1) == i);
+			assert(a.getAllocatorIndex(nthFreeListSize!i) == i);
+			assert(a.getAllocatorIndex(nthFreeListSize!i+1) == i+1);
 		}
-		assert(false);
+		assert(a.getAllocatorIndex(size_t.max) == freeListCount);
 	}
 
 	private static pure size_t nthFreeListSize(size_t i)() { return 1 << (i + minExponent); }
@@ -507,11 +552,11 @@ final class FreeListAlloc : Allocator
 nothrow:
 	private static struct FreeListSlot { FreeListSlot* next; }
 	private {
-		immutable size_t m_elemSize;
-		Allocator m_baseAlloc;
 		FreeListSlot* m_firstFree = null;
 		size_t m_nalloc = 0;
 		size_t m_nfree = 0;
+		Allocator m_baseAlloc;
+		immutable size_t m_elemSize;
 	}
 
 	this(size_t elem_size, Allocator base_allocator)
@@ -538,12 +583,12 @@ nothrow:
 			m_firstFree = slot.next;
 			slot.next = null;
 			mem = (cast(void*)slot)[0 .. m_elemSize];
-			m_nfree--;
+			debug m_nfree--;
 		} else {
 			mem = m_baseAlloc.alloc(m_elemSize);
 			//logInfo("Alloc %d bytes: alloc: %d, free: %d", SZ, s_nalloc, s_nfree);
 		}
-		m_nalloc++;
+		debug m_nalloc++;
 		//logInfo("Alloc %d bytes: alloc: %d, free: %d", SZ, s_nalloc, s_nfree);
 		return mem;
 	}
@@ -566,9 +611,10 @@ nothrow:
 	}
 }
 
-template FreeListObjectAlloc(T, bool USE_GC = true, bool INIT = true)
+struct FreeListObjectAlloc(T, bool USE_GC = true, bool INIT = true, EXTRA = void)
 {
 	enum ElemSize = AllocSize!T;
+	enum ElemSlotSize = max(AllocSize!T + AllocSize!EXTRA, Slot.sizeof);
 
 	static if( is(T == class) ){
 		alias TR = T;
@@ -576,25 +622,42 @@ template FreeListObjectAlloc(T, bool USE_GC = true, bool INIT = true)
 		alias TR = T*;
 	}
 
-	TR alloc(ARGS...)(ARGS args)
+	struct Slot { Slot* next; }
+
+	private static Slot* s_firstFree;
+
+	static TR alloc(ARGS...)(ARGS args)
 	{
-		//logInfo("alloc %s/%d", T.stringof, ElemSize);
-		auto mem = manualAllocator().alloc(ElemSize);
-		static if( hasIndirections!T ) GC.addRange(mem.ptr, ElemSize);
-		static if( INIT ) return internalEmplace!T(mem, args);
+		void[] mem;
+		if (s_firstFree !is null) {
+			auto ret = s_firstFree;
+			s_firstFree = s_firstFree.next;
+			ret.next = null;
+			mem = (cast(void*)ret)[0 .. ElemSize];
+		} else {
+			//logInfo("alloc %s/%d", T.stringof, ElemSize);
+			mem = manualAllocator().alloc(ElemSlotSize);
+			static if( hasIndirections!T ) GC.addRange(mem.ptr, ElemSlotSize);
+		}
+
+		static if (INIT) return cast(TR)internalEmplace!(Unqual!T)(mem, args); // FIXME: this emplace has issues with qualified types, but Unqual!T may result in the wrong constructor getting called.
 		else return cast(TR)mem.ptr;
 	}
 
-	void free(TR obj)
+	static void free(TR obj)
 	{
-		static if( INIT ){
-			scope(failure) assert(0, "You shouldn't throw in destructors");
+		static if (INIT) {
+			scope (failure) assert(0, "You shouldn't throw in destructors");
 			auto objc = obj;
 			static if (is(TR == T*)) .destroy(*objc);//typeid(T).destroy(cast(void*)obj);
 			else .destroy(objc);
 		}
-		static if( hasIndirections!T ) GC.removeRange(cast(void*)obj);
-		manualAllocator().free((cast(void*)obj)[0 .. ElemSize]);
+
+		auto sl = cast(Slot*)obj;
+		sl.next = s_firstFree;
+		s_firstFree = sl;
+		//static if( hasIndirections!T ) GC.removeRange(cast(void*)obj);
+		//manualAllocator().free((cast(void*)obj)[0 .. ElemSlotSize]);
 	}
 }
 
@@ -612,6 +675,7 @@ template AllocSize(T)
 
 struct FreeListRef(T, bool INIT = true)
 {
+	alias ObjAlloc = FreeListObjectAlloc!(T, true, INIT, int);
 	enum ElemSize = AllocSize!T;
 
 	static if( is(T == class) ){
@@ -627,10 +691,7 @@ struct FreeListRef(T, bool INIT = true)
 	{
 		//logInfo("refalloc %s/%d", T.stringof, ElemSize);
 		FreeListRef ret;
-		auto mem = manualAllocator().alloc(ElemSize + int.sizeof);
-		static if( hasIndirections!T ) GC.addRange(mem.ptr, ElemSize);
-		static if( INIT ) ret.m_object = cast(TR)internalEmplace!(Unqual!T)(mem, args);
-		else ret.m_object = cast(TR)mem.ptr;
+		ret.m_object = ObjAlloc.alloc(args);
 		ret.refCount = 1;
 		return ret;
 	}
@@ -667,19 +728,9 @@ struct FreeListRef(T, bool INIT = true)
 	void clear()
 	{
 		checkInvariants();
-		if( m_object ){
-			if( --this.refCount == 0 ){
-				static if( INIT ){
-					//logInfo("ref %s destroy", T.stringof);
-					//typeid(T).destroy(cast(void*)m_object);
-					auto objc = m_object;
-					static if (is(TR == T)) .destroy(objc);
-					else .destroy(*objc);
-					//logInfo("ref %s destroyed", T.stringof);
-				}
-				static if( hasIndirections!T ) GC.removeRange(cast(void*)m_object);
-				manualAllocator().free((cast(void*)m_object)[0 .. ElemSize+int.sizeof]);
-			}
+		if (m_object) {
+			if (--this.refCount == 0)
+				ObjAlloc.free(m_object);
 		}
 
 		m_object = null;

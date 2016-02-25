@@ -21,7 +21,7 @@ import libasync;
 import libasync.internals.memory;
 import libasync.types : Status;
 
-import std.algorithm : min;
+import std.algorithm : min, max;
 import std.array;
 import std.container : Array;
 import std.conv;
@@ -81,7 +81,8 @@ final class LibasyncDriver : EventDriver {
 		debug Thread m_ownerThread;
 		AsyncTimer m_timerEvent;
 		TimerQueue!TimerInfo m_timers;
-		SysTime m_nextSched;
+		SysTime m_nextSched = SysTime.max;
+		shared AsyncSignal m_exitSignal;
 	}
 
 	this(DriverCore core) nothrow
@@ -113,6 +114,11 @@ final class LibasyncDriver : EventDriver {
 		s_evLoop = getThreadEventLoop();
 		if (!gs_evLoop)
 			gs_evLoop = s_evLoop;
+			
+		m_exitSignal = new shared AsyncSignal(getEventLoop());
+		m_exitSignal.run({
+				m_break = true;
+			});
 		logTrace("Loaded libasync backend in thread %s", Thread.getThis().name);
 
 	}
@@ -134,7 +140,7 @@ final class LibasyncDriver : EventDriver {
 
 	int runEventLoop()
 	{
-		while(!m_break && getEventLoop().loop()){
+		while(!m_break && getEventLoop().loop(int.max.msecs)){
 			processTimers();
 			getDriverCore().notifyIdle();
 		}
@@ -145,7 +151,7 @@ final class LibasyncDriver : EventDriver {
 
 	int runEventLoopOnce()
 	{
-		getEventLoop().loop(0.seconds);
+		getEventLoop().loop(int.max.msecs);
 		processTimers();
 		getDriverCore().notifyIdle();
 		logTrace("runEventLoopOnce exit");
@@ -166,7 +172,7 @@ final class LibasyncDriver : EventDriver {
 	void exitEventLoop()
 	{
 		logDebug("Exiting (%s)", m_break);
-		m_break = true;
+		m_exitSignal.trigger();
 
 	}
 
@@ -264,7 +270,7 @@ final class LibasyncDriver : EventDriver {
 
 	}
 
-	LibasyncTCPConnection connectTCP(NetworkAddress addr)
+	LibasyncTCPConnection connectTCP(NetworkAddress addr, NetworkAddress bind_addr)
 	{
 		AsyncTCPConnection conn = new AsyncTCPConnection(getEventLoop());
 
@@ -279,6 +285,8 @@ final class LibasyncDriver : EventDriver {
 			tcp_connection.acquireWriter();
 
 		tcp_connection.m_tcpImpl.conn = conn;
+		//conn.local = bind_addr;
+		conn.ip(bind_addr.toAddressString(), bind_addr.port);
 		conn.peer = addr;
 
 		enforce(conn.run(&tcp_connection.handler), "An error occured while starting a new connection: " ~ conn.error);
@@ -377,11 +385,12 @@ final class LibasyncDriver : EventDriver {
 	private void processTimers()
 	{
 		if (!m_timers.anyPending) return;
-
 		logTrace("Processing due timers");
 		// process all timers that have expired up to now
 		auto now = Clock.currTime(UTC());
-
+		// event loop timer will need to be rescheduled because we'll process everything until now
+		m_nextSched = SysTime.max;
+		
 		m_timers.consumeTimeouts(now, (timer, periodic, ref data) {
 			Task owner = data.owner;
 			auto callback = data.callback;
@@ -405,15 +414,17 @@ final class LibasyncDriver : EventDriver {
 		logTrace("Rescheduling timer event %s", Task.getThis());
 		
 		// don't bother scheduling, the timers will be processed before leaving for the event loop
-		if (m_nextSched <= Clock.currTime())
+		if (m_nextSched <= Clock.currTime(UTC()))
 			return;
 		
 		bool first;
 		auto next = m_timers.getFirstTimeout();
 		Duration dur;
 		if (next == SysTime.max) return;
-		dur = next - now;
-		m_nextSched = next;
+		dur = max(1.msecs, next - now);
+		if (m_nextSched != next)
+			m_nextSched = next;
+		else return;
 		if (dur.total!"seconds"() >= int.max)
 			return; // will never trigger, don't bother
 		if (!m_timerEvent) {
@@ -796,19 +807,22 @@ final class LibasyncManualEvent : ManualEvent {
 		Array!(void*) ms_signals;
 
 		core.sync.mutex.Mutex m_mutex;
+
+		@property size_t instanceID() nothrow { return atomicLoad(m_instance); }
+		@property void instanceID(size_t instance) nothrow{ atomicStore(m_instance, instance); }
 	}
 
 	this(LibasyncDriver driver)
-	{
+	nothrow {
+		static if (__VERSION__ <= 2066) scope (failure) assert(false);
 		m_mutex = new core.sync.mutex.Mutex;
-		m_instance = generateID();
-		assert(m_instance != 0);
+		instanceID = generateID();
 	}
 
 	~this()
 	{
 		try {
-			recycleID(m_instance);
+			recycleID(instanceID);
 
 			foreach (ref signal; ms_signals[]) {
 				if (signal) {
@@ -849,11 +863,12 @@ final class LibasyncManualEvent : ManualEvent {
 
 		bool signal_exists;
 
-		if (s_eventWaiters.length <= m_instance) {
+		size_t instance = instanceID;
+		if (s_eventWaiters.length <= instance)
 			expandWaiters();
-		}
-		logTrace("Acquire event ID#%d", m_instance);
-		auto taskList = s_eventWaiters[m_instance];
+
+		logTrace("Acquire event ID#%d", instance);
+		auto taskList = s_eventWaiters[instance];
 		if (taskList.length > 0)
 			signal_exists = true;
 
@@ -862,7 +877,7 @@ final class LibasyncManualEvent : ManualEvent {
 			sig.run(&onSignal);
 			synchronized (m_mutex) ms_signals.insertBack(cast(void*)sig);
 		}
-		s_eventWaiters[m_instance].insertBack(Task.getThis());
+		s_eventWaiters[instance].insertBack(Task.getThis());
 	}
 
 	void release()
@@ -870,12 +885,14 @@ final class LibasyncManualEvent : ManualEvent {
 		assert(amOwner(), "Releasing non-acquired signal.");
 
 		import std.algorithm : countUntil;
-		auto taskList = s_eventWaiters[m_instance];
-		auto idx = taskList[].countUntil!((a, b) => a == b)(Task.getThis());
-		logTrace("Release event ID#%d", m_instance);
-		s_eventWaiters[m_instance].linearRemove(taskList[idx .. idx+1]);
 
-		if (s_eventWaiters[m_instance].empty) {
+		size_t instance = instanceID;
+		auto taskList = s_eventWaiters[instance];
+		auto idx = taskList[].countUntil!((a, b) => a == b)(Task.getThis());
+		logTrace("Release event ID#%d", instance);
+		s_eventWaiters[instance].linearRemove(taskList[idx .. idx+1]);
+
+		if (s_eventWaiters[instance].empty) {
 			removeMySignal();
 		}
 	}
@@ -883,8 +900,9 @@ final class LibasyncManualEvent : ManualEvent {
 	bool amOwner()
 	{
 		import std.algorithm : countUntil;
-		if (s_eventWaiters.length <= m_instance) return false;
-		auto taskList = s_eventWaiters[m_instance];
+		size_t instance = instanceID;
+		if (s_eventWaiters.length <= instance) return false;
+		auto taskList = s_eventWaiters[instance];
 		if (taskList.length == 0) return false;
 
 		auto idx = taskList[].countUntil!((a, b) => a == b)(Task.getThis());
@@ -942,9 +960,12 @@ final class LibasyncManualEvent : ManualEvent {
 	private void expandWaiters() {
 		size_t maxID;
 		synchronized(gs_mutex) maxID = gs_maxID;
-		s_eventWaiters.reserve(maxID + 1);
+		s_eventWaiters.reserve(maxID);
 		logTrace("gs_maxID: %d", maxID);
-		foreach (i; s_eventWaiters.length .. s_eventWaiters.capacity) {
+		size_t s_ev_len = s_eventWaiters.length;
+		size_t s_ev_cap = s_eventWaiters.capacity;
+		assert(maxID > s_eventWaiters.length);
+		foreach (i; s_ev_len .. s_ev_cap) {
 			s_eventWaiters.insertBack(Array!Task.init);
 		}
 	}
@@ -956,8 +977,9 @@ final class LibasyncManualEvent : ManualEvent {
 			auto thread = Thread.getThis();
 			auto core = getDriverCore();
 
-			logTrace("Got context: %d", m_instance);
-			foreach (Task task; s_eventWaiters[m_instance][]) {
+			size_t instance = instanceID;
+			logTrace("Got context: %d", instance);
+			foreach (Task task; s_eventWaiters[instance][]) {
 				logTrace("Task Found");
 				core.resumeTask(task);
 			}
@@ -998,6 +1020,8 @@ final class LibasyncTCPListener : TCPListener {
 		else init(cast(shared) this);
 
 	}
+
+	@property NetworkAddress bindAddress() { return m_local; }
 
 	@property void delegate(TCPConnection) connectionCallback() { return m_connectionCallback; }
 
@@ -1717,7 +1741,8 @@ __gshared Array!size_t gs_availID;
 __gshared size_t gs_maxID;
 __gshared core.sync.mutex.Mutex gs_mutex;
 
-private size_t generateID() {
+private size_t generateID()
+nothrow {
 	size_t idx;
 	import std.algorithm : max;
 	try {
@@ -1734,7 +1759,7 @@ private size_t generateID() {
 			idx = getIdx();
 			if (idx == 0) {
 				import std.range : iota;
-				gs_availID.insert( iota(gs_maxID + 1, max(32, gs_maxID * 2), 1) );
+				gs_availID.insert( iota(gs_maxID + 1, max(32, gs_maxID * 2 + 1), 1) );
 				gs_maxID = gs_availID[$-1];
 				idx = getIdx();
 			}
@@ -1743,12 +1768,12 @@ private size_t generateID() {
 		assert(false, "Failed to generate necessary ID for Manual Event waiters: " ~ e.msg);
 	}
 
-	return idx;
+	return idx - 1;
 }
 
 void recycleID(size_t id) {
 	try {
-		synchronized(gs_mutex) gs_availID.insert(id);
+		synchronized(gs_mutex) gs_availID.insert(id+1);
 	}
 	catch (Exception e) {
 		assert(false, "Error destroying Manual Event ID: " ~ id.to!string ~ " [" ~ e.msg ~ "]");
